@@ -1,3 +1,5 @@
+#include "asm-generic/int-ll64.h"
+#include "linux/compiler_attributes.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/completion.h>
@@ -8,22 +10,23 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
+#include <linux/mm.h>
+#include <linux/vmstat.h>
 
 #include "nanorand.h"
+#include "util.h"
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Kernel Alloc Test");
+MODULE_DESCRIPTION("Kernel Alloc Benchmark");
 MODULE_AUTHOR("Lars Wrenger");
 
 static atomic64_t curr_threads;
+static u64 max_threads;
 
 static DEFINE_PER_CPU(struct task_struct *, per_cpu_tasks);
 
-static DEFINE_PER_CPU(struct completion, worker_completes);
-static DEFINE_PER_CPU(struct completion, worker_activates);
-
-static DECLARE_COMPLETION(worker_barrier);
-static DECLARE_COMPLETION(worker_barrier0);
+struct c_barrier outer_barrier;
+struct c_barrier inner_barrier;
 
 enum alloc_bench {
 	/// Allocate a large number of pages and free them in sequential order
@@ -32,16 +35,32 @@ enum alloc_bench {
 	BENCH_REPEAT,
 	/// Allocate a large number of pages and free them in random order
 	BENCH_RAND,
+	/// Allocate all of the memory of a zone and free half of it randomly.
+	/// Then reallocate and measure fragmentation.
+	BENCH_FRAG,
 };
 
 /// Benchmark args
 struct alloc_config {
 	/// Benchmark (see enum alloc_bench)
-	u64 bench;
-	/// Array of thread counts
-	u64 *threads;
-	/// Len of threads array
-	u64 threads_len;
+	enum alloc_bench bench;
+	union {
+		// bulk, repeat, rand
+		struct {
+			/// Array of thread counts
+			u64 *threads;
+			/// Len of threads array
+			u64 threads_len;
+			/// Number of repetitions
+		};
+		// frag
+		struct {
+			/// NUMA node
+			u64 node;
+			/// Percentage to be reallocated per iteration
+			u64 realloc_percentage;
+		};
+	};
 	/// Number of repetitions
 	u64 iterations;
 	/// Number of allocations per thread
@@ -50,7 +69,12 @@ struct alloc_config {
 	u64 order;
 };
 
-static struct alloc_config alloc_config = { 0, NULL, 0, 0, 0, 0 };
+static struct alloc_config alloc_config = { .bench = 0,
+					    { .threads = NULL,
+					      .threads_len = 0 },
+					    .iterations = 0,
+					    .allocs = 0,
+					    .order = 0 };
 
 static bool running = false;
 
@@ -71,7 +95,7 @@ struct perf {
 static struct perf *measurements = NULL;
 static u64 out_index = 0;
 
-__maybe_unused static struct page ***rand_pages;
+static struct page ***rand_pages;
 
 __maybe_unused static u64 cycles(void)
 {
@@ -81,96 +105,134 @@ __maybe_unused static u64 cycles(void)
 };
 
 /// Alloc a number of pages at once and free them afterwards
-__maybe_unused static void bulk(u64 num_allocs)
+static void bulk()
 {
 	u64 j;
 	u64 timer;
-	struct completion *worker_complete = this_cpu_ptr(&worker_completes);
 	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 
-	struct page **pages =
-		kmalloc_array(num_allocs, sizeof(struct page *), GFP_KERNEL);
+	struct page **pages = kmalloc_array(alloc_config.allocs,
+					    sizeof(struct page *), GFP_KERNEL);
 	BUG_ON(pages == NULL);
 
 	// complete initialization
-	complete(worker_complete);
-
-	// Start allocations
-	wait_for_completion(&worker_barrier0);
+	pr_info("start bulk");
+	c_barrier_sync(&inner_barrier);
 
 	timer = ktime_get_ns();
-	for (j = 0; j < num_allocs; j++) {
+	for (j = 0; j < alloc_config.allocs; j++) {
 		pages[j] = alloc_pages(GFP_USER, alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
-	t_perf->get = (ktime_get_ns() - timer) / num_allocs;
+	t_perf->get = (ktime_get_ns() - timer) / alloc_config.allocs;
 
-	complete(worker_complete);
-
-	// Start frees
-	wait_for_completion(&worker_barrier);
+	c_barrier_sync(&inner_barrier);
 
 	timer = ktime_get_ns();
-	for (j = 0; j < num_allocs; j++) {
+	for (j = 0; j < alloc_config.allocs; j++) {
 		__free_pages(pages[j], alloc_config.order);
 	}
-	t_perf->put = (ktime_get_ns() - timer) / num_allocs;
+	t_perf->put = (ktime_get_ns() - timer) / alloc_config.allocs;
 	kfree(pages);
 }
 
 /// Alloc and free the same page
-__maybe_unused static void repeat(u64 num_allocs)
+static void repeat()
 {
 	u64 j;
 	u64 timer;
-	struct completion *worker_complete = this_cpu_ptr(&worker_completes);
+
 	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 
 	struct page *page;
 
 	// complete initialization
-	complete(worker_complete);
-
-	// Start reallocs
-	wait_for_completion(&worker_barrier);
+	c_barrier_sync(&inner_barrier);
 
 	timer = ktime_get_ns();
-	for (j = 0; j < num_allocs; j++) {
+	for (j = 0; j < alloc_config.allocs; j++) {
 		page = alloc_pages(GFP_USER, alloc_config.order);
 		BUG_ON(page == NULL);
 		__free_pages(page, alloc_config.order);
 	}
-	timer = (ktime_get_ns() - timer) / num_allocs;
+	timer = (ktime_get_ns() - timer) / alloc_config.allocs;
 	t_perf->get = timer;
 	t_perf->put = timer;
 }
 
 /// Random free and realloc
-__maybe_unused static void rand(u64 num_allocs)
+static void rand(u64 *rng)
 {
 	u64 timer;
-	struct completion *worker_complete = this_cpu_ptr(&worker_completes);
 	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 	u64 threads = atomic64_read(&curr_threads);
 
-	struct page **pages =
-		kmalloc_array(num_allocs, sizeof(struct page *), GFP_KERNEL);
+	struct page **pages = kmalloc_array(alloc_config.allocs,
+					    sizeof(struct page *), GFP_KERNEL);
 	BUG_ON(pages == NULL);
 
-	for (u64 j = 0; j < num_allocs; j++) {
+	for (u64 j = 0; j < alloc_config.allocs; j++) {
 		pages[j] = alloc_pages(GFP_USER, alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	rand_pages[raw_smp_processor_id()] = pages;
 
 	// complete initialization
-	complete(worker_complete);
-
-	// Start allocations
-	wait_for_completion(&worker_barrier0);
+	c_barrier_sync(&inner_barrier);
 
 	// shuffle between all threads
 	if (raw_smp_processor_id() == 0) {
+		pr_info("shuffle: a=%llu t=%llu\n", alloc_config.allocs,
+			threads);
+		for (u64 i = 0; i < alloc_config.allocs * threads; i++) {
+			u64 j = nanorand_random_range(
+				rng, 0, alloc_config.allocs * threads);
+			swap(rand_pages[i % threads][i / threads],
+			     rand_pages[j % threads][j / threads]);
+		}
+		pr_info("setup finished\n");
+	}
+
+	c_barrier_sync(&inner_barrier);
+
+	timer = ktime_get_ns();
+	for (u64 j = 0; j < alloc_config.allocs; j++) {
+		__free_pages(pages[j], alloc_config.order);
+	}
+	timer = (ktime_get_ns() - timer) / alloc_config.allocs;
+	t_perf->get = timer;
+	t_perf->put = timer;
+
+	kfree(pages);
+}
+
+static u64 init_frag()
+{
+	int cpu = raw_smp_processor_id();
+	u64 threads = atomic64_read(&curr_threads);
+	int node = cpu_to_node(cpu);
+	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+
+	// Approximation!
+	u64 free_pages = zone_page_state(zone, NR_FREE_PAGES) -
+			 (threads * 10 * (1 << alloc_config.order));
+	u64 num_allocs = (free_pages / (1 << alloc_config.order)) / threads;
+
+	// Allocate almost all of the memory of this zone
+	struct page **pages =
+		kmalloc_array(num_allocs, sizeof(struct page *), GFP_KERNEL);
+	BUG_ON(pages == NULL);
+
+	for (u64 j = 0; j < num_allocs; j++) {
+		pages[j] = alloc_pages_node(node, GFP_USER, alloc_config.order);
+		BUG_ON(pages[j] == NULL);
+	}
+	rand_pages[cpu] = pages;
+
+	c_barrier_sync(&inner_barrier);
+
+	// shuffle between all threads
+	if (cpu == 0) {
 		u64 rng = 42;
 		pr_info("shuffle: a=%llu t=%llu\n", num_allocs, threads);
 		for (u64 i = 0; i < num_allocs * threads; i++) {
@@ -181,48 +243,82 @@ __maybe_unused static void rand(u64 num_allocs)
 		}
 		pr_info("setup finished\n");
 	}
+	return num_allocs;
+}
 
-	complete(worker_complete);
+static void frag(u64 *rng, u64 num_allocs)
+{
+	u64 cpu = raw_smp_processor_id();
+	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
+	u64 num_reallocs = (num_allocs * alloc_config.realloc_percentage) / 100;
 
-	// Start reallocs
-	wait_for_completion(&worker_barrier);
+	int node = cpu_to_node(cpu);
+	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+	struct page **pages = rand_pages[cpu];
 
-	timer = ktime_get_ns();
-	for (u64 j = 0; j < num_allocs; j++) {
-		__free_pages(pages[j], alloc_config.order);
+	// complete initialization
+	c_barrier_sync(&inner_barrier);
+
+	for (u64 j = 0; j < num_reallocs; j++) {
+		u64 i = nanorand_random_range(rng, 0, num_allocs);
+		__free_pages(pages[i], alloc_config.order);
+		pages[i] =
+			__alloc_pages_node(node, GFP_USER, alloc_config.order);
+		BUG_ON(pages[i] == 0);
 	}
-	timer = (ktime_get_ns() - timer) / num_allocs;
-	t_perf->get = timer;
-	t_perf->put = timer;
+
+	c_barrier_sync(&inner_barrier);
+
+	t_perf->get = 0; // TODO: count free huge pages
+	t_perf->put = zone_page_state(zone, NR_FREE_PAGES);
 
 	kfree(pages);
 }
 
 static int worker(void *data)
 {
-	struct completion *worker_complete = this_cpu_ptr(&worker_completes);
-	struct completion *worker_activate = this_cpu_ptr(&worker_activates);
+	u64 task_id = (u64)data;
+	u64 num_allocs = 0;
+	u64 cpu = raw_smp_processor_id();
+	u64 thread_rng = cpu;
 
 	pr_info("Worker %u bench %u\n", smp_processor_id(), alloc_config.bench);
 
+	if (alloc_config.bench == BENCH_FRAG) {
+		num_allocs = init_frag();
+	}
+
 	for (;;) {
-		wait_for_completion(worker_activate);
+		u64 threads;
+
+		c_barrier_sync(&outer_barrier);
+
 		if (kthread_should_stop() || !running) {
 			pr_info("Stopping worker %d\n", smp_processor_id());
-			return 0;
+			break;
+		}
+		threads = atomic64_read(&curr_threads);
+
+		pr_info("Execute t=%d c=%d run=%d", task_id, cpu,
+			task_id < threads);
+		if (task_id < threads) {
+			switch (alloc_config.bench) {
+			case BENCH_BULK:
+				bulk();
+				break;
+			case BENCH_REPEAT:
+				repeat();
+				break;
+			case BENCH_RAND:
+				rand(&thread_rng);
+				break;
+			case BENCH_FRAG:
+				frag(&thread_rng, num_allocs);
+				break;
+			}
 		}
 
-		reinit_completion(worker_activate);
-
-		if (alloc_config.bench == BENCH_BULK) {
-			bulk(alloc_config.allocs);
-		} else if (alloc_config.bench == BENCH_REPEAT) {
-			repeat(alloc_config.allocs);
-		} else if (alloc_config.bench == BENCH_RAND) {
-			rand(alloc_config.allocs);
-		}
-
-		complete(worker_complete);
+		c_barrier_sync(&outer_barrier);
 	}
 
 	return 0;
@@ -246,6 +342,8 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 	}
 
 	for (ssize_t i = out_index; i < alloc_config.threads_len; i++) {
+		u64 threads = alloc_config.bench != BENCH_FRAG ? alloc_config.threads[i] : max_threads;
+
 		// The output buffer has only the size of a PAGE.
 		// If our output is larger we have to output it in multiple steps.
 		if (len < PAGE_SIZE - alloc_config.iterations * 128) {
@@ -258,10 +356,9 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 					buf + len,
 					"Kernel,%llu,%lu,%llu,%llu,%llu,%llu,%llu,"
 					"%llu,%llu,0,0\n",
-					alloc_config.threads[i], iter,
-					alloc_config.allocs, p->get_min,
-					p->get_avg, p->get_max, p->put_min,
-					p->put_avg, p->put_max);
+					threads, iter, alloc_config.allocs,
+					p->get_min, p->get_avg, p->get_max,
+					p->put_min, p->put_avg, p->put_max);
 			}
 		} else {
 			out_index = i;
@@ -275,39 +372,21 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 void iteration(u32 bench, u64 i, u64 iter)
 {
 	struct perf *p;
-	u64 threads = alloc_config.threads[i];
+	u64 threads = max_threads;
+
+	if (bench != BENCH_FRAG) {
+		threads = alloc_config.threads[i];
+	}
+
 	atomic64_set(&curr_threads, threads);
+	c_barrier_reinit(&inner_barrier, threads);
 
 	pr_info("Start threads %llu\n", threads);
-	for (u64 t = 0; t < threads; t++) {
-		struct completion *worker_activate =
-			per_cpu_ptr(&worker_activates, t);
-		complete(worker_activate);
-	}
-
-	// Init
-	for (u64 t = 0; t < threads; t++) {
-		struct completion *worker_complete =
-			per_cpu_ptr(&worker_completes, t);
-		wait_for_completion(worker_complete);
-		reinit_completion(worker_complete);
-	}
+	c_barrier_sync(&outer_barrier);
 
 	pr_info("Waiting for %llu workers...\n", threads);
-
-	// bulk and rand have two phases (alloc and free)
-	if (bench == BENCH_BULK || bench == BENCH_RAND) {
-		complete_all(&worker_barrier0);
-		for (u64 t = 0; t < threads; t++) {
-			struct completion *worker_complete =
-				per_cpu_ptr(&worker_completes, t);
-			wait_for_completion(worker_complete);
-			reinit_completion(worker_complete);
-		}
-		reinit_completion(&worker_barrier0);
-	}
-
-	complete_all(&worker_barrier);
+	c_barrier_sync(&outer_barrier);
+	pr_info("Finish iteration\n");
 
 	p = &measurements[i * alloc_config.iterations + iter];
 	p->get_min = (u64)-1;
@@ -317,13 +396,8 @@ void iteration(u32 bench, u64 i, u64 iter)
 	p->put_avg = 0;
 	p->put_max = 0;
 	for (u64 t = 0; t < threads; t++) {
-		struct completion *worker_complete =
-			per_cpu_ptr(&worker_completes, t);
 		struct thread_perf *t_perf = per_cpu_ptr(&thread_perf, t);
 		u64 get, put;
-
-		wait_for_completion(worker_complete);
-		reinit_completion(worker_complete);
 
 		get = t_perf->get;
 		put = t_perf->put;
@@ -337,10 +411,6 @@ void iteration(u32 bench, u64 i, u64 iter)
 	}
 	p->get_avg /= threads;
 	p->put_avg /= threads;
-
-	reinit_completion(&worker_barrier);
-
-	pr_info("Finish iteration\n");
 }
 
 static bool whitespace(char c)
@@ -393,7 +463,7 @@ static const char *next_uint_list(const char *buf, const char *end, u64 **list,
 	if (threads_len == 0)
 		return NULL;
 
-	// parse thread counts
+	// parse ints
 	threads = kmalloc_array(threads_len, sizeof(u64), GFP_KERNEL);
 	for (; buf < end && !whitespace(*buf); buf++) {
 		if (*buf == ',') {
@@ -435,39 +505,40 @@ static const char *next_uint_list(const char *buf, const char *end, u64 **list,
 	return buf;
 }
 
-/// Usage: <bench> <threads> <iterations> <allocs> <order>
+/// Parsing the cli args
 static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 {
+	enum alloc_bench bench;
 	u64 *threads;
 	u64 threads_len;
 	u64 iterations;
 	u64 allocs;
 	u64 order;
+	u64 node;
+	u64 realloc_percentage;
 	const char *end = buf + len;
 
 	if (len == 0 || buf == NULL || args == NULL) {
-		pr_err("usage: <bench> <threads> <iterations> <allocs>");
+		pr_err("usage: \n"
+		       "\t(bulk|repeat|rand) <iterations> <allocs> <order> <threads>\n"
+		       "\tfrag <iterations> <allocs> <order> <node> <realloc_percentage>");
 		return false;
 	}
 
 	if (strncmp(buf, "bulk", min(len, 4ul)) == 0) {
-		args->bench = BENCH_BULK;
+		bench = BENCH_BULK;
 		buf += 4;
 	} else if (strncmp(buf, "repeat", min(len, 6ul)) == 0) {
-		args->bench = BENCH_REPEAT;
+		bench = BENCH_REPEAT;
 		buf += 6;
 	} else if (strncmp(buf, "rand", min(len, 4ul)) == 0) {
-		args->bench = BENCH_RAND;
+		bench = BENCH_RAND;
 		buf += 4;
 	} else {
-		pr_err("Invalid mode %s", buf);
+		pr_err("Invalid <bench>: %s", buf);
 		return false;
 	}
 
-	if ((buf = next_uint_list(buf, end, &threads, &threads_len)) == NULL) {
-		pr_err("Invalid <threads>");
-		return false;
-	}
 	if ((buf = next_uint(buf, end, &iterations)) == NULL) {
 		pr_err("Invalid <iterations>");
 		return false;
@@ -481,14 +552,37 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 		return false;
 	}
 
+	if (bench != BENCH_FRAG) {
+		if ((buf = next_uint_list(buf, end, &threads, &threads_len)) ==
+		    NULL) {
+			pr_err("Invalid <threads>");
+			return false;
+		}
+	} else {
+		if ((buf = next_uint(buf, end, &node)) == NULL) {
+			pr_err("Invalid <node>");
+			return false;
+		}
+		if ((buf = next_uint(buf, end, &realloc_percentage)) == NULL) {
+			pr_err("Invalid <realloc_percentage>");
+			return false;
+		}
+	}
+
 	buf = str_skip(buf, end, true);
 	if (buf != end)
 		return false;
 
-	if (args->threads)
-		kfree(args->threads);
-	args->threads = threads;
-	args->threads_len = threads_len;
+	args->bench = bench;
+	if (bench != BENCH_FRAG) {
+		if (args->threads)
+			kfree(args->threads);
+		args->threads = threads;
+		args->threads_len = threads_len;
+	} else {
+		args->node = node;
+		args->realloc_percentage = realloc_percentage;
+	}
 	args->iterations = iterations;
 	args->allocs = allocs;
 	args->order = order;
@@ -498,7 +592,10 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 			 const char *buf, size_t len)
 {
-	u64 max_threads = 0;
+	int cpu;
+	const struct cpumask *mask = &__cpu_online_mask;
+	u64 threads = 0;
+	u64 threads_len = 1;
 
 	if (running)
 		return -EINPROGRESS;
@@ -508,30 +605,47 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 	running = true;
 
-	for (u64 i = 0; i < alloc_config.threads_len; i++) {
-		max_threads = max(alloc_config.threads[i], max_threads);
+	max_threads = 0;
+	if (alloc_config.bench != BENCH_FRAG) {
+		// Retrieve max thread count
+		threads_len = alloc_config.threads_len;
+		for (u64 i = 0; i < threads_len; i++) {
+			max_threads = max(alloc_config.threads[i], max_threads);
+		}
+	} else {
+		// cpus of this node!
+		int cpu;
+		mask = cpumask_of_node(alloc_config.node);
+		for_each_cpu(cpu, mask) {
+			max_threads += 1;
+		}
 	}
+	BUG_ON(max_threads > num_online_cpus());
+	c_barrier_reinit(&outer_barrier, max_threads + 1);
 
 	if (measurements)
 		kfree(measurements);
 
-	measurements = kmalloc_array(alloc_config.threads_len *
-					     alloc_config.iterations,
+	measurements = kmalloc_array(threads_len * alloc_config.iterations,
 				     sizeof(struct perf), GFP_KERNEL);
 
 	// Initialize workers in advance
-	for (u64 t = 0; t < max_threads; t++) {
-		struct completion *worker_commit =
-			per_cpu_ptr(&worker_completes, t);
-		struct completion *worker_wait =
-			per_cpu_ptr(&worker_activates, t);
-		struct task_struct **task = per_cpu_ptr(&per_cpu_tasks, t);
-		init_completion(worker_commit);
-		init_completion(worker_wait);
-		*task = kthread_run_on_cpu(worker, NULL, t, "worker");
+	for_each_cpu(cpu, mask) {
+		struct task_struct **task;
+		if (threads >= max_threads)
+			break;
+		task = per_cpu_ptr(&per_cpu_tasks, cpu);
+		*task = kthread_run_on_cpu(worker, (void *)threads, cpu,
+					   "worker");
+		threads++;
 	}
 
-	for (u64 i = 0; i < alloc_config.threads_len; i++) {
+	// Frag init
+	if (alloc_config.bench == BENCH_FRAG) {
+		c_barrier_sync(&outer_barrier);
+	}
+
+	for (u64 i = 0; i < threads_len; i++) {
 		for (u64 iter = 0; iter < alloc_config.iterations; iter++) {
 			iteration(alloc_config.bench, i, iter);
 		}
@@ -540,9 +654,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 	pr_info("Cleanup\n");
 
 	running = false;
-	for (u64 t = 0; t < max_threads; t++) {
-		complete(per_cpu_ptr(&worker_activates, t));
-	}
+	c_barrier_sync(&outer_barrier);
 
 	pr_info("Finished\n");
 
@@ -581,6 +693,9 @@ static int alloc_init_module(void)
 
 	rand_pages =
 		kmalloc_array(num_present_cpus(), sizeof(void *), GFP_KERNEL);
+
+	c_barrier_init(&outer_barrier, num_present_cpus() + 1, "outer");
+	c_barrier_init(&inner_barrier, 1, "inner");
 
 	return 0;
 }
