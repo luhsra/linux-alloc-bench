@@ -1,5 +1,3 @@
-#include "asm-generic/int-ll64.h"
-#include "linux/compiler_attributes.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/completion.h>
@@ -104,6 +102,11 @@ __maybe_unused static u64 cycles(void)
 	return ((u64)lo) | ((u64)hi << 32);
 };
 
+__always_inline static gfp_t gfp_flags(int order)
+{
+	return GFP_USER | (order ? __GFP_COMP : 0);
+}
+
 /// Alloc a number of pages at once and free them afterwards
 static void bulk()
 {
@@ -121,7 +124,8 @@ static void bulk()
 
 	timer = ktime_get_ns();
 	for (j = 0; j < alloc_config.allocs; j++) {
-		pages[j] = alloc_pages(GFP_USER, alloc_config.order);
+		pages[j] = alloc_pages(gfp_flags(alloc_config.order),
+				       alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	t_perf->get = (ktime_get_ns() - timer) / alloc_config.allocs;
@@ -151,7 +155,8 @@ static void repeat()
 
 	timer = ktime_get_ns();
 	for (j = 0; j < alloc_config.allocs; j++) {
-		page = alloc_pages(GFP_USER, alloc_config.order);
+		page = alloc_pages(gfp_flags(alloc_config.order),
+				   alloc_config.order);
 		BUG_ON(page == NULL);
 		__free_pages(page, alloc_config.order);
 	}
@@ -172,7 +177,8 @@ static void rand(u64 *rng)
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < alloc_config.allocs; j++) {
-		pages[j] = alloc_pages(GFP_USER, alloc_config.order);
+		pages[j] = alloc_pages(gfp_flags(alloc_config.order),
+				       alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	rand_pages[raw_smp_processor_id()] = pages;
@@ -224,7 +230,8 @@ static u64 init_frag()
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < num_allocs; j++) {
-		pages[j] = alloc_pages_node(node, GFP_USER, alloc_config.order);
+		pages[j] = alloc_pages_node(node, gfp_flags(alloc_config.order),
+					    alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	rand_pages[cpu] = pages;
@@ -262,8 +269,9 @@ static void frag(u64 *rng, u64 num_allocs)
 	for (u64 j = 0; j < num_reallocs; j++) {
 		u64 i = nanorand_random_range(rng, 0, num_allocs);
 		__free_pages(pages[i], alloc_config.order);
-		pages[i] =
-			__alloc_pages_node(node, GFP_USER, alloc_config.order);
+		pages[i] = __alloc_pages_node(node,
+					      gfp_flags(alloc_config.order),
+					      alloc_config.order);
 		BUG_ON(pages[i] == 0);
 	}
 
@@ -342,7 +350,9 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 	}
 
 	for (ssize_t i = out_index; i < alloc_config.threads_len; i++) {
-		u64 threads = alloc_config.bench != BENCH_FRAG ? alloc_config.threads[i] : max_threads;
+		u64 threads = alloc_config.bench != BENCH_FRAG ?
+				      alloc_config.threads[i] :
+				      max_threads;
 
 		// The output buffer has only the size of a PAGE.
 		// If our output is larger we have to output it in multiple steps.
