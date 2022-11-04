@@ -10,6 +10,7 @@
 #include <linux/timekeeping.h>
 #include <linux/mm.h>
 #include <linux/vmstat.h>
+#include <linux/vmalloc.h>
 
 #include "nanorand.h"
 #include "util.h"
@@ -49,7 +50,8 @@ struct alloc_config {
 			u64 *threads;
 			/// Len of threads array
 			u64 threads_len;
-			/// Number of repetitions
+			/// Number of allocations per thread
+			u64 allocs;
 		};
 		// frag
 		struct {
@@ -61,8 +63,6 @@ struct alloc_config {
 	};
 	/// Number of repetitions
 	u64 iterations;
-	/// Number of allocations per thread
-	u64 allocs;
 	/// Size of the allocations
 	u64 order;
 };
@@ -215,19 +215,23 @@ static void rand(u64 *rng)
 static u64 init_frag()
 {
 	int cpu = raw_smp_processor_id();
-	u64 threads = atomic64_read(&curr_threads);
+	u64 threads = max_threads;
 	int node = cpu_to_node(cpu);
 	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+	struct page **pages;
 
-	// Approximation!
-	u64 free_pages = zone_page_state(zone, NR_FREE_PAGES) -
+	// Approximation! Leave some for other operations...
+	u64 free_pages = zone->present_pages -
 			 (threads * 10 * (1 << alloc_config.order));
 	u64 num_allocs = (free_pages / (1 << alloc_config.order)) / threads;
+	num_allocs = num_allocs * 90 / 100;
 
 	// Allocate almost all of the memory of this zone
-	struct page **pages =
-		kmalloc_array(num_allocs, sizeof(struct page *), GFP_KERNEL);
+	// Note: This array might be larger than MAX_ORDER
+	pages = vmalloc_array(num_allocs, sizeof(struct page *));
 	BUG_ON(pages == NULL);
+
+	pr_info("init frag %d\n", cpu);
 
 	for (u64 j = 0; j < num_allocs; j++) {
 		pages[j] = alloc_pages_node(node, gfp_flags(alloc_config.order),
@@ -236,7 +240,8 @@ static u64 init_frag()
 	}
 	rand_pages[cpu] = pages;
 
-	c_barrier_sync(&inner_barrier);
+	pr_info("alloc finished %d\n", cpu);
+	c_barrier_sync(&outer_barrier);
 
 	// shuffle between all threads
 	if (cpu == 0) {
@@ -245,6 +250,10 @@ static u64 init_frag()
 		for (u64 i = 0; i < num_allocs * threads; i++) {
 			u64 j = nanorand_random_range(&rng, 0,
 						      num_allocs * threads);
+			BUG_ON(i % threads >= threads ||
+			       j % threads >= threads);
+			BUG_ON(i / threads >= num_allocs ||
+			       j / threads >= num_allocs);
 			swap(rand_pages[i % threads][i / threads],
 			     rand_pages[j % threads][j / threads]);
 		}
@@ -256,11 +265,9 @@ static u64 init_frag()
 static void frag(u64 *rng, u64 num_allocs)
 {
 	u64 cpu = raw_smp_processor_id();
-	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 	u64 num_reallocs = (num_allocs * alloc_config.realloc_percentage) / 100;
 
 	int node = cpu_to_node(cpu);
-	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
 	struct page **pages = rand_pages[cpu];
 
 	// complete initialization
@@ -274,13 +281,6 @@ static void frag(u64 *rng, u64 num_allocs)
 					      alloc_config.order);
 		BUG_ON(pages[i] == 0);
 	}
-
-	c_barrier_sync(&inner_barrier);
-
-	t_perf->get = 0; // TODO: count free huge pages
-	t_perf->put = zone_page_state(zone, NR_FREE_PAGES);
-
-	kfree(pages);
 }
 
 static int worker(void *data)
@@ -329,6 +329,13 @@ static int worker(void *data)
 		c_barrier_sync(&outer_barrier);
 	}
 
+	if (alloc_config.bench == BENCH_FRAG) {
+		pr_info("uninit frag\n");
+		for (u64 j = 0; j < num_allocs; j++) {
+			__free_pages(rand_pages[cpu][j], alloc_config.order);
+		}
+	}
+
 	return 0;
 }
 
@@ -340,6 +347,12 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 	struct perf *p;
 	ssize_t len = 0;
 
+	ssize_t max_out_index =
+		alloc_config.bench != BENCH_FRAG ? alloc_config.threads_len : 1;
+	u64 allocs = alloc_config.bench != BENCH_FRAG ?
+			     alloc_config.allocs :
+			     alloc_config.realloc_percentage;
+
 	if (running || measurements == NULL)
 		return -EINPROGRESS;
 
@@ -349,7 +362,7 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 			       "get_max,put_min,put_avg,put_max,init,total\n");
 	}
 
-	for (ssize_t i = out_index; i < alloc_config.threads_len; i++) {
+	for (ssize_t i = out_index; i < max_out_index; i++) {
 		u64 threads = alloc_config.bench != BENCH_FRAG ?
 				      alloc_config.threads[i] :
 				      max_threads;
@@ -366,9 +379,9 @@ static ssize_t out_show(struct kobject *kobj, struct kobj_attribute *attr,
 					buf + len,
 					"Kernel,%llu,%lu,%llu,%llu,%llu,%llu,%llu,"
 					"%llu,%llu,0,0\n",
-					threads, iter, alloc_config.allocs,
-					p->get_min, p->get_avg, p->get_max,
-					p->put_min, p->put_avg, p->put_max);
+					threads, iter, allocs, p->get_min,
+					p->get_avg, p->get_max, p->put_min,
+					p->put_avg, p->put_max);
 			}
 		} else {
 			out_index = i;
@@ -399,28 +412,40 @@ void iteration(u32 bench, u64 i, u64 iter)
 	pr_info("Finish iteration\n");
 
 	p = &measurements[i * alloc_config.iterations + iter];
-	p->get_min = (u64)-1;
+	p->get_min = 0;
 	p->get_avg = 0;
 	p->get_max = 0;
-	p->put_min = (u64)-1;
+	p->put_min = 0;
 	p->put_avg = 0;
 	p->put_max = 0;
-	for (u64 t = 0; t < threads; t++) {
-		struct thread_perf *t_perf = per_cpu_ptr(&thread_perf, t);
-		u64 get, put;
+	if (alloc_config.bench != BENCH_FRAG) {
+		p->get_min = (u64)-1;
+		p->put_min = (u64)-1;
+		for (u64 t = 0; t < threads; t++) {
+			struct thread_perf *t_perf =
+				per_cpu_ptr(&thread_perf, t);
+			u64 get, put;
 
-		get = t_perf->get;
-		put = t_perf->put;
+			get = t_perf->get;
+			put = t_perf->put;
 
-		p->get_min = min(p->get_min, get);
-		p->get_avg += get;
-		p->get_max = max(p->get_max, get);
-		p->put_min = min(p->put_min, put);
-		p->put_avg += put;
-		p->put_max = max(p->put_max, put);
+			p->get_min = min(p->get_min, get);
+			p->get_avg += get;
+			p->get_max = max(p->get_max, get);
+			p->put_min = min(p->put_min, put);
+			p->put_avg += put;
+			p->put_max = max(p->put_max, put);
+		}
+		p->get_avg /= threads;
+		p->put_avg /= threads;
+	} else {
+		struct zone *zone =
+			&NODE_DATA(alloc_config.node)->node_zones[ZONE_NORMAL];
+
+		p->get_avg = zone->free_area[9].nr_free +
+			     2 * zone->free_area[10].nr_free;
+		p->put_avg = zone_page_state(zone, NR_FREE_PAGES);
 	}
-	p->get_avg /= threads;
-	p->put_avg /= threads;
 }
 
 static bool whitespace(char c)
@@ -531,7 +556,7 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 	if (len == 0 || buf == NULL || args == NULL) {
 		pr_err("usage: \n"
 		       "\t(bulk|repeat|rand) <iterations> <allocs> <order> <threads>\n"
-		       "\tfrag <iterations> <allocs> <order> <node> <realloc_percentage>");
+		       "\tfrag <iterations> <realloc_percentage> <order> <node>");
 		return false;
 	}
 
@@ -544,24 +569,35 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 	} else if (strncmp(buf, "rand", min(len, 4ul)) == 0) {
 		bench = BENCH_RAND;
 		buf += 4;
+	} else if (strncmp(buf, "frag", min(len, 4ul)) == 0) {
+		bench = BENCH_FRAG;
+		buf += 4;
 	} else {
 		pr_err("Invalid <bench>: %s", buf);
 		return false;
 	}
 
-	if ((buf = next_uint(buf, end, &iterations)) == NULL) {
+	if ((buf = next_uint(buf, end, &iterations)) == NULL ||
+	    iterations == 0) {
 		pr_err("Invalid <iterations>");
 		return false;
 	}
-	if ((buf = next_uint(buf, end, &allocs)) == NULL) {
-		pr_err("Invalid <allocs>");
-		return false;
+	if (bench != BENCH_FRAG) {
+		if ((buf = next_uint(buf, end, &allocs)) == NULL) {
+			pr_err("Invalid <allocs>");
+			return false;
+		}
+	} else {
+		if ((buf = next_uint(buf, end, &realloc_percentage)) == NULL ||
+		    realloc_percentage == 0 || realloc_percentage > 100) {
+			pr_err("Invalid <realloc_percentage>");
+			return false;
+		}
 	}
-	if ((buf = next_uint(buf, end, &order)) == NULL) {
+	if ((buf = next_uint(buf, end, &order)) == NULL || order >= MAX_ORDER) {
 		pr_err("Invalid <order>");
 		return false;
 	}
-
 	if (bench != BENCH_FRAG) {
 		if ((buf = next_uint_list(buf, end, &threads, &threads_len)) ==
 		    NULL) {
@@ -569,12 +605,9 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 			return false;
 		}
 	} else {
-		if ((buf = next_uint(buf, end, &node)) == NULL) {
+		if ((buf = next_uint(buf, end, &node)) == NULL ||
+		    node > nr_online_nodes) {
 			pr_err("Invalid <node>");
-			return false;
-		}
-		if ((buf = next_uint(buf, end, &realloc_percentage)) == NULL) {
-			pr_err("Invalid <realloc_percentage>");
 			return false;
 		}
 	}
