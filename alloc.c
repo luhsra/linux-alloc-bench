@@ -355,6 +355,46 @@ static int worker(void *data)
 	return 0;
 }
 
+// The parameter hp_pfn describes a huge page slot (512 pages).
+// It must therefore be huge page aligned,
+// pfn+512-1 must still be in the range.
+static inline bool is_huge_page_slot_free(u64 hp_pfn)
+{
+	for (u64 pfn = hp_pfn; pfn < hp_pfn + HPAGE_PMD_NR; pfn++) {
+		struct page *page;
+
+		if (!pfn_valid(pfn))
+			return false;
+
+		page = pfn_to_page(pfn);
+		if (page_ref_count(page) != 0)
+			return false;
+	}
+	return true;
+}
+
+static unsigned long count_free_huge_pages_slots(struct zone *zone)
+{
+	const u64 HMASK = ~(HPAGE_PMD_NR - 1);
+	u64 free_slots = 0;
+	u64 pfn_start = zone->zone_start_pfn;
+	u64 pfn_end = zone_end_pfn(zone);
+
+	if (pfn_start % HPAGE_PMD_NR) {
+		pfn_start = (pfn_start + HPAGE_PMD_NR) & HMASK;
+	}
+	if (pfn_end % HPAGE_PMD_NR) {
+		pfn_end &= HMASK;
+	}
+
+	for (u64 pfn = pfn_start; pfn < pfn_end; pfn += HPAGE_PMD_NR) {
+		if (is_huge_page_slot_free(pfn))
+			free_slots++;
+	}
+
+	return free_slots;
+}
+
 void iteration(u32 bench, u64 i, u64 iter)
 {
 	struct perf *p;
@@ -412,6 +452,7 @@ void iteration(u32 bench, u64 i, u64 iter)
 #else
 		p->get_avg = nvalloc_free_huge_count(zone->nvalloc);
 #endif
+		p->get_min = count_free_huge_pages_slots(zone);
 		p->put_avg = zone_page_state(zone, NR_FREE_PAGES);
 	}
 }
@@ -438,16 +479,16 @@ static void out_stop(struct seq_file *m, void *arg)
 
 static int out_show_frag(struct seq_file *m)
 {
-	seq_puts(m, "alloc,threads,iter,allocs,small,huge\n");
+	seq_puts(m, "threads,iter,allocs,small,huge,huge2\n");
 
 	// The output buffer has only the size of a PAGE.
 	// If our output is larger we have to output it in multiple steps.
 	for (ssize_t iter = 0; iter < alloc_config.iterations; iter++) {
 		struct perf *p = &measurements[iter];
 
-		seq_printf(m, "Kernel,%llu,%lu,%llu,%llu,%llu\n", max_threads,
+		seq_printf(m, "%llu,%lu,%llu,%llu,%llu,%llu\n", max_threads,
 			   iter, alloc_config.realloc_percentage, p->put_avg,
-			   p->get_avg);
+			   p->get_avg, p->get_min);
 		BUG_ON(seq_has_overflowed(m));
 	}
 
