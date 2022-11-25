@@ -279,21 +279,43 @@ static u64 init_frag(u64 task_id)
 static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 {
 	u64 num_reallocs = (num_allocs * alloc_config.realloc_percentage) / 100;
+	int node = alloc_config.node;
+	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
 
-	int node = cpu_to_node(raw_smp_processor_id());
+	u64 rng_copy = *rng;
+
 	struct page **pages = rand_pages[task_id];
 	BUG_ON(pages == NULL);
 
 	// complete initialization
 	c_barrier_sync(&inner_barrier);
 
-	for (u64 j = 0; j < num_reallocs; j++) {
+	for (u64 j = 0; j < num_reallocs;) {
 		u64 i = nanorand_random_range(rng, 0, num_allocs);
-		__free_pages(pages[i], alloc_config.order);
-		pages[i] = __alloc_pages_node(node,
-					      gfp_flags(alloc_config.order),
-					      alloc_config.order);
-		BUG_ON(pages[i] == NULL);
+		if (pages[i] != NULL) {
+			__free_pages(pages[i], alloc_config.order);
+			pages[i] = NULL;
+			j++;
+		}
+	}
+
+	c_barrier_sync(&inner_barrier);
+
+	// Draining to allow the kernel allocator to defragment its pages...
+	// FIXME: This seems have no effect on the kernel -> it still does not defragment!
+	drain_local_pages(zone);
+
+	c_barrier_sync(&inner_barrier);
+
+	for (u64 j = 0; j < num_reallocs;) {
+		u64 i = nanorand_random_range(&rng_copy, 0, num_allocs);
+		if (pages[i] == NULL) {
+			pages[i] = __alloc_pages_node(
+				node, gfp_flags(alloc_config.order),
+				alloc_config.order);
+			BUG_ON(pages[i] == NULL);
+			j++;
+		}
 	}
 }
 
@@ -302,7 +324,7 @@ static int worker(void *data)
 	u64 task_id = (u64)data;
 	u64 num_allocs = 0;
 	u64 cpu = raw_smp_processor_id();
-	u64 thread_rng = cpu;
+	u64 thread_rng = task_id;
 
 	pr_info("Worker t=%u c=%u bench %u\n", task_id, cpu,
 		alloc_config.bench);
@@ -350,6 +372,8 @@ static int worker(void *data)
 			__free_pages(rand_pages[task_id][j],
 				     alloc_config.order);
 		}
+		vfree(rand_pages[task_id]);
+		rand_pages[task_id] = NULL;
 	}
 
 	return 0;
@@ -373,7 +397,7 @@ static inline bool is_huge_page_slot_free(u64 hp_pfn)
 	return true;
 }
 
-static unsigned long count_free_huge_pages_slots(struct zone *zone)
+static u64 count_free_huge_pages_slots(struct zone *zone)
 {
 	const u64 HMASK = ~(HPAGE_PMD_NR - 1);
 	u64 free_slots = 0;
@@ -399,6 +423,7 @@ void iteration(u32 bench, u64 i, u64 iter)
 {
 	struct perf *p;
 	u64 threads = max_threads;
+	u64 time;
 
 	if (bench != BENCH_FRAG) {
 		threads = alloc_config.threads[i];
@@ -407,12 +432,15 @@ void iteration(u32 bench, u64 i, u64 iter)
 	atomic64_set(&curr_threads, threads);
 	c_barrier_reinit(&inner_barrier, threads);
 
-	pr_info("Start threads %llu\n", threads);
+	pr_info("Start interation: %llu (%llu threads)\n", iter, threads);
+	time = ktime_get_ns();
 	c_barrier_sync(&outer_barrier);
 
-	pr_info("Waiting for %llu workers...\n", threads);
+	// Workers do their work...
+
 	c_barrier_sync(&outer_barrier);
-	pr_info("Finish iteration\n");
+	time = ktime_get_ns() - time;
+	pr_info("Finish iteration: %lld (%lld ns)\n", iter, time);
 
 	p = &measurements[i * alloc_config.iterations + iter];
 	p->get_min = 0;
@@ -468,7 +496,8 @@ static void *out_start(struct seq_file *m, loff_t *pos)
 static void *out_next(struct seq_file *m, void *arg, loff_t *pos)
 {
 	(*pos)++;
-	if (alloc_config.bench == BENCH_FRAG || *pos >= alloc_config.threads_len)
+	if (alloc_config.bench == BENCH_FRAG ||
+	    *pos >= alloc_config.threads_len)
 		return NULL;
 	return pos;
 }
@@ -499,7 +528,7 @@ static int out_show_frag(struct seq_file *m)
 /// Note: `buf` is PAGE_SIZE large!
 static int out_show(struct seq_file *m, void *arg)
 {
-	u64 i = *(loff_t*)arg;
+	u64 i = *(loff_t *)arg;
 
 	if (running || measurements == NULL)
 		return -EINPROGRESS;
