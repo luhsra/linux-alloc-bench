@@ -13,6 +13,8 @@
 #include <linux/vmalloc.h>
 #include <linux/seq_file.h>
 #include <linux/proc_fs.h>
+#include <linux/preempt.h>
+#include <linux/spinlock.h>
 
 #ifdef CONFIG_NVALLOC
 #include <nvalloc.h>
@@ -95,8 +97,11 @@ struct perf {
 	u64 put_min;
 	u64 put_avg;
 	u64 put_max;
+	u16 *frag_buf;
 };
 static struct perf *measurements = NULL;
+static u64 total_iterations = 0;
+static u64 frag_iteration_len = 0;
 
 static struct page ***rand_pages;
 
@@ -381,42 +386,88 @@ static int worker(void *data)
 
 // The parameter hp_pfn describes a huge page slot (512 pages).
 // It must therefore be huge page aligned,
-// pfn+512-1 must still be in the range.
-static inline bool is_huge_page_slot_free(u64 hp_pfn)
+// pfn+512-1 must still be in the range of the zone.
+static inline u16 count_free_pages_per_huge_page_slot(u64 hp_pfn)
 {
+	u64 free = 0;
 	for (u64 pfn = hp_pfn; pfn < hp_pfn + HPAGE_PMD_NR; pfn++) {
 		struct page *page;
 
-		if (!pfn_valid(pfn))
-			return false;
+		if (!pfn_valid(pfn)) {
+			printk(KERN_WARNING "Invalid pfn: %lx\n", pfn);
+			continue;
+		}
 
 		page = pfn_to_page(pfn);
-		if (page_ref_count(page) != 0)
-			return false;
+
+		/* Only headpage is initialized to -1 */
+		if (PageBuddy(page))
+			free++;
+		else if (page_count(page) == 0 && is_free_buddy_page(page))
+			free++;
 	}
-	return true;
+	return free;
 }
 
-static u64 count_free_huge_pages_slots(struct zone *zone)
+// from mm/page_alloc.c
+static inline int pindex_to_order(unsigned int pindex)
+{
+	int order = pindex / MIGRATE_PCPTYPES;
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	if (pindex == NR_LOWORDER_PCP_LISTS)
+		order = pageblock_order;
+#else
+	VM_BUG_ON(order > PAGE_ALLOC_COSTLY_ORDER);
+#endif
+
+	return order;
+}
+
+static void add_pcplist_pages(struct zone *zone, u16 *buf)
+{
+	u64 pfn_start = zone->zone_start_pfn;
+	struct per_cpu_pages *pcp;
+	unsigned long flags;
+	preempt_disable(); /* only for !CONFIG_PREEMPT_RT */
+	pcp = this_cpu_ptr(zone->per_cpu_pageset);
+	spin_lock_irqsave(&pcp->lock, flags);
+
+	for (int i = 0; i < NR_PCP_LISTS; i++) {
+		int order = pindex_to_order(i);
+		struct list_head *list = &pcp->lists[i];
+		struct page *page;
+		list_for_each_entry(page, list, pcp_list) {
+			u64 pfn = page_to_pfn(page);
+			u64 index = (pfn - pfn_start) / HPAGE_PMD_NR;
+			/* Assume no order > hugepage order in pcp cache */
+			buf[index] += (1 << order);
+		}
+	}
+
+	spin_unlock_irqrestore(&pcp->lock, flags);
+	preempt_enable();
+}
+
+static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
 {
 	const u64 HMASK = ~(HPAGE_PMD_NR - 1);
-	u64 free_slots = 0;
 	u64 pfn_start = zone->zone_start_pfn;
 	u64 pfn_end = zone_end_pfn(zone);
+	unsigned long flags;
 
-	if (pfn_start % HPAGE_PMD_NR) {
+	if (pfn_start % HPAGE_PMD_NR)
 		pfn_start = (pfn_start + HPAGE_PMD_NR) & HMASK;
-	}
-	if (pfn_end % HPAGE_PMD_NR) {
+	if (pfn_end % HPAGE_PMD_NR)
 		pfn_end &= HMASK;
-	}
 
+	spin_lock_irqsave(&zone->lock, flags);
 	for (u64 pfn = pfn_start; pfn < pfn_end; pfn += HPAGE_PMD_NR) {
-		if (is_huge_page_slot_free(pfn))
-			free_slots++;
+		u16 free = count_free_pages_per_huge_page_slot(pfn);
+		buf[(pfn - pfn_start) / HPAGE_PMD_NR] = free;
 	}
-
-	return free_slots;
+	add_pcplist_pages(zone, buf);
+	spin_unlock_irqrestore(&zone->lock, flags);
 }
 
 void iteration(u32 bench, u64 i, u64 iter)
@@ -480,8 +531,8 @@ void iteration(u32 bench, u64 i, u64 iter)
 #else
 		p->get_avg = nvalloc_free_huge_count(zone->nvalloc);
 #endif
-		p->get_min = count_free_huge_pages_slots(zone);
 		p->put_avg = zone_page_state(zone, NR_FREE_PAGES);
+		get_huge_page_slots_info(zone, p->frag_buf);
 	}
 }
 
@@ -809,12 +860,32 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 	BUG_ON(max_threads > num_online_cpus());
 	c_barrier_reinit(&outer_barrier, max_threads + 1);
 
-	if (measurements)
+	if (measurements) {
+		// FIXME !!
+		/* for (u64 i = 0; i < total_iterations; i++) { */
+		/* 	vfree(measurements[i].frag_buf); */
+		/* } */
+		total_iterations = 0;
 		kfree(measurements);
+	}
 
 	measurements = kmalloc_array(threads_len * alloc_config.iterations,
 				     sizeof(struct perf), GFP_KERNEL);
 	BUG_ON(measurements == NULL);
+
+	if (alloc_config.bench == BENCH_FRAG) {
+		int node = alloc_config.node;
+		struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+		u64 hpslots = zone->spanned_pages / HPAGE_PMD_NR;
+		total_iterations =
+			alloc_config.threads_len * alloc_config.iterations;
+		frag_iteration_len = hpslots;
+
+		for (u64 i = 0; i < total_iterations; i++) {
+			measurements[i].frag_buf = vmalloc(hpslots * sizeof(u16));
+			BUG_ON(measurements[i].frag_buf == NULL);
+		}
+	}
 
 	// Initialize workers in advance
 	pr_info("Initialize workers\n");
@@ -853,6 +924,47 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 	return len;
 }
 
+static ssize_t fragout_read(struct file *file, char __user *buf,
+			    size_t count, loff_t *ppos)
+{
+	const u64 u16mask = sizeof(u16) - 1;
+	u16 __user *out = (u16 __user *)buf;
+	unsigned long max_bytes;
+	u64 global_index;
+	u64 curr_iteration;
+	u64 iter_index;
+	u64 len;
+
+	if (*ppos & u16mask || count & u16mask)
+		return -EINVAL;
+	if (!measurements || frag_iteration_len == 0)
+		return 0;
+
+	max_bytes = total_iterations * frag_iteration_len * sizeof(u16);
+	if (*ppos >= max_bytes)
+		return 0;
+
+	global_index = *ppos / sizeof(u16);
+	iter_index = global_index % frag_iteration_len;
+	curr_iteration = global_index / frag_iteration_len;
+	count = min_t(unsigned long, count, PAGE_SIZE);
+	count = min_t(unsigned long, count,
+		      (frag_iteration_len - iter_index) * sizeof(u16));
+	len = count / sizeof(u16);
+
+	for (u64 i = 0; i < len; i++, iter_index++) {
+		out[i] = measurements[curr_iteration].frag_buf[iter_index];
+	}
+
+	*ppos += count;
+	return count;
+}
+
+static const struct proc_ops fragout_ops = {
+	/* .proc_lseek	= mem_lseek, */
+	.proc_read	= fragout_read,
+};
+
 static const struct seq_operations out_op = {
 	.start = out_start,
 	.next = out_next,
@@ -867,6 +979,7 @@ static const struct proc_ops run_ops = {
 
 static struct proc_dir_entry *dir;
 static struct proc_dir_entry *out;
+static struct proc_dir_entry *fragout;
 static struct proc_dir_entry *run;
 
 static int alloc_init_module(void)
@@ -882,10 +995,17 @@ static int alloc_init_module(void)
 		proc_remove(dir);
 		return -ENOMEM;
 	}
+	if ((fragout = proc_create("fragout", 0220, dir, &fragout_ops)) == NULL) {
+		pr_err("Proc mkdir failed\n");
+		proc_remove(dir);
+		proc_remove(out);
+		return -ENOMEM;
+	}
 	if ((run = proc_create("run", 0220, dir, &run_ops)) == NULL) {
 		pr_err("Proc mkdir failed\n");
 		proc_remove(dir);
 		proc_remove(out);
+		proc_remove(fragout);
 		return -ENOMEM;
 	}
 
