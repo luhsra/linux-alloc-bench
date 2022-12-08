@@ -15,6 +15,7 @@
 #include <linux/proc_fs.h>
 #include <linux/preempt.h>
 #include <linux/spinlock.h>
+#include <linux/uaccess.h>
 
 #ifdef CONFIG_NVALLOC
 #include <nvalloc.h>
@@ -100,8 +101,6 @@ struct perf {
 	u16 *frag_buf;
 };
 static struct perf *measurements = NULL;
-static u64 total_iterations = 0;
-static u64 frag_iteration_len = 0;
 
 static struct page ***rand_pages;
 
@@ -818,6 +817,7 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 	u64 threads = 0;
 	u64 threads_len = 1;
 	char *kbuf;
+	u64 previous_iterations = alloc_config.iterations;
 
 	if (running)
 		return -EINPROGRESS;
@@ -854,18 +854,17 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 		int cpu;
 		mask = cpumask_of_node(alloc_config.node);
 		for_each_cpu(cpu, mask) {
-			max_threads += 1;
+			max_threads++;
 		}
 	}
 	BUG_ON(max_threads > num_online_cpus());
 	c_barrier_reinit(&outer_barrier, max_threads + 1);
 
 	if (measurements) {
-		// FIXME !!
-		/* for (u64 i = 0; i < total_iterations; i++) { */
-		/* 	vfree(measurements[i].frag_buf); */
-		/* } */
-		total_iterations = 0;
+		for (u64 i = 0; i < previous_iterations; i++) {
+			if (measurements[i].frag_buf)
+				vfree(measurements[i].frag_buf);
+		}
 		kfree(measurements);
 	}
 
@@ -877,12 +876,10 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 		int node = alloc_config.node;
 		struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
 		u64 hpslots = zone->spanned_pages / HPAGE_PMD_NR;
-		total_iterations =
-			alloc_config.threads_len * alloc_config.iterations;
-		frag_iteration_len = hpslots;
 
-		for (u64 i = 0; i < total_iterations; i++) {
-			measurements[i].frag_buf = vmalloc(hpslots * sizeof(u16));
+		for (u64 i = 0; i < alloc_config.iterations; i++) {
+			measurements[i].frag_buf =
+				vmalloc(hpslots * sizeof(u16));
 			BUG_ON(measurements[i].frag_buf == NULL);
 		}
 	}
@@ -924,37 +921,39 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 	return len;
 }
 
-static ssize_t fragout_read(struct file *file, char __user *buf,
-			    size_t count, loff_t *ppos)
+static ssize_t fragout_read(struct file *file, char __user *buf, size_t count,
+			    loff_t *ppos)
 {
 	const u64 u16mask = sizeof(u16) - 1;
-	u16 __user *out = (u16 __user *)buf;
 	unsigned long max_bytes;
 	u64 global_index;
 	u64 curr_iteration;
 	u64 iter_index;
-	u64 len;
+
+	struct zone *zone =
+		&NODE_DATA(alloc_config.node)->node_zones[ZONE_NORMAL];
+	u64 hpslots = zone->spanned_pages / HPAGE_PMD_NR;
+
+	BUG_ON(alloc_config.bench != BENCH_FRAG);
 
 	if (*ppos & u16mask || count & u16mask)
 		return -EINVAL;
-	if (!measurements || frag_iteration_len == 0)
+	if (!measurements || hpslots == 0)
 		return 0;
 
-	max_bytes = total_iterations * frag_iteration_len * sizeof(u16);
+	max_bytes = alloc_config.iterations * hpslots * sizeof(u16);
 	if (*ppos >= max_bytes)
 		return 0;
 
 	global_index = *ppos / sizeof(u16);
-	iter_index = global_index % frag_iteration_len;
-	curr_iteration = global_index / frag_iteration_len;
+	iter_index = global_index % hpslots;
+	curr_iteration = global_index / hpslots;
 	count = min_t(unsigned long, count, PAGE_SIZE);
 	count = min_t(unsigned long, count,
-		      (frag_iteration_len - iter_index) * sizeof(u16));
-	len = count / sizeof(u16);
+		      (hpslots - iter_index) * sizeof(u16));
 
-	for (u64 i = 0; i < len; i++, iter_index++) {
-		out[i] = measurements[curr_iteration].frag_buf[iter_index];
-	}
+	BUG_ON(copy_to_user(
+		buf, &measurements[curr_iteration].frag_buf[iter_index], count));
 
 	*ppos += count;
 	return count;
@@ -962,7 +961,7 @@ static ssize_t fragout_read(struct file *file, char __user *buf,
 
 static const struct proc_ops fragout_ops = {
 	/* .proc_lseek	= mem_lseek, */
-	.proc_read	= fragout_read,
+	.proc_read = fragout_read,
 };
 
 static const struct seq_operations out_op = {
@@ -995,7 +994,8 @@ static int alloc_init_module(void)
 		proc_remove(dir);
 		return -ENOMEM;
 	}
-	if ((fragout = proc_create("fragout", 0220, dir, &fragout_ops)) == NULL) {
+	if ((fragout = proc_create("fragout", 0440, dir, &fragout_ops)) ==
+	    NULL) {
 		pr_err("Proc mkdir failed\n");
 		proc_remove(dir);
 		proc_remove(out);
