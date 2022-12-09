@@ -244,8 +244,9 @@ static u64 init_frag(u64 task_id)
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < num_allocs; j++) {
-		pages[j] = alloc_pages_node(node, gfp_flags(alloc_config.order),
-					    alloc_config.order);
+		pages[j] = alloc_pages_node(
+			node, gfp_flags(alloc_config.order) | __GFP_THISNODE,
+			alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	BUG_ON(rand_pages == NULL);
@@ -314,8 +315,9 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 	for (u64 j = 0; j < num_reallocs;) {
 		u64 i = nanorand_random_range(&rng_copy, 0, num_allocs);
 		if (pages[i] == NULL) {
-			pages[i] = __alloc_pages_node(
-				node, gfp_flags(alloc_config.order),
+			pages[i] = alloc_pages_node(
+				node,
+				gfp_flags(alloc_config.order) | __GFP_THISNODE,
 				alloc_config.order);
 			BUG_ON(pages[i] == NULL);
 			j++;
@@ -383,6 +385,7 @@ static int worker(void *data)
 	return 0;
 }
 
+#ifndef CONFIG_NVALLOC
 // The parameter hp_pfn describes a huge page slot (512 pages).
 // It must therefore be huge page aligned,
 // pfn+512-1 must still be in the range of the zone.
@@ -468,6 +471,19 @@ static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
 	add_pcplist_pages(zone, buf);
 	spin_unlock_irqrestore(&zone->lock, flags);
 }
+#else
+static void for_each_huge_page(void *arg, u16 count)
+{
+	u16 **buf = arg;
+	*((*buf)++) = count;
+}
+static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
+{
+	u16 *local_buf = buf;
+	nvalloc_for_each_huge_page(zone->nvalloc, for_each_huge_page,
+				   &local_buf);
+}
+#endif
 
 void iteration(u32 bench, u64 i, u64 iter)
 {
@@ -952,8 +968,9 @@ static ssize_t fragout_read(struct file *file, char __user *buf, size_t count,
 	count = min_t(unsigned long, count,
 		      (hpslots - iter_index) * sizeof(u16));
 
-	BUG_ON(copy_to_user(
-		buf, &measurements[curr_iteration].frag_buf[iter_index], count));
+	BUG_ON(copy_to_user(buf,
+			    &measurements[curr_iteration].frag_buf[iter_index],
+			    count));
 
 	*ppos += count;
 	return count;
