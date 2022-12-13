@@ -90,6 +90,7 @@ struct thread_perf {
 	u64 put;
 };
 static DEFINE_PER_CPU(struct thread_perf, thread_perf);
+static DEFINE_PER_CPU(struct page **, allocated_pages);
 
 struct perf {
 	u64 get_min;
@@ -101,8 +102,6 @@ struct perf {
 	u16 *frag_buf;
 };
 static struct perf *measurements = NULL;
-
-static struct page ***rand_pages;
 
 __maybe_unused static u64 cycles(void)
 {
@@ -181,8 +180,8 @@ static void rand(u64 task_id, u64 *rng)
 	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 	u64 threads = atomic64_read(&curr_threads);
 
-	struct page **pages = kmalloc_array(alloc_config.allocs,
-					    sizeof(struct page *), GFP_KERNEL);
+	struct page **pages =
+		vmalloc_array(alloc_config.allocs, sizeof(struct page *));
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < alloc_config.allocs; j++) {
@@ -190,7 +189,7 @@ static void rand(u64 task_id, u64 *rng)
 				       alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
-	rand_pages[task_id] = pages;
+	this_cpu_write(allocated_pages, pages);
 
 	// complete initialization
 	c_barrier_sync(&inner_barrier);
@@ -202,8 +201,9 @@ static void rand(u64 task_id, u64 *rng)
 		for (u64 i = 0; i < alloc_config.allocs * threads; i++) {
 			u64 j = nanorand_random_range(
 				rng, 0, alloc_config.allocs * threads);
-			swap(rand_pages[i % threads][i / threads],
-			     rand_pages[j % threads][j / threads]);
+			struct page **cpu_a = per_cpu(allocated_pages, i % threads);
+			struct page **cpu_b = per_cpu(allocated_pages, i % threads);
+			swap(cpu_a[i / threads], cpu_b[j / threads]);
 		}
 		pr_info("setup finished\n");
 	}
@@ -218,7 +218,8 @@ static void rand(u64 task_id, u64 *rng)
 	t_perf->get = timer;
 	t_perf->put = timer;
 
-	kfree(pages);
+	this_cpu_write(allocated_pages, NULL);
+	vfree(pages);
 }
 
 static u64 init_frag(u64 task_id)
@@ -249,8 +250,7 @@ static u64 init_frag(u64 task_id)
 			alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
-	BUG_ON(rand_pages == NULL);
-	rand_pages[task_id] = pages;
+	this_cpu_write(allocated_pages, pages);
 
 	c_barrier_sync(&outer_barrier);
 
@@ -261,12 +261,9 @@ static u64 init_frag(u64 task_id)
 		for (u64 i = 0; i < num_allocs * threads; i++) {
 			u64 j = nanorand_random_range(&rng, 0,
 						      num_allocs * threads);
-			BUG_ON(i % threads >= threads ||
-			       j % threads >= threads);
-			BUG_ON(i / threads >= num_allocs ||
-			       j / threads >= num_allocs);
-			swap(rand_pages[i % threads][i / threads],
-			     rand_pages[j % threads][j / threads]);
+			struct page **cpu_a = per_cpu(allocated_pages, i % threads);
+			struct page **cpu_b = per_cpu(allocated_pages, i % threads);
+			swap(cpu_a[i / threads], cpu_b[j / threads]);
 		}
 		pr_info("setup finished\n");
 	}
@@ -289,7 +286,7 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 
 	u64 rng_copy = *rng;
 
-	struct page **pages = rand_pages[task_id];
+	struct page **pages = this_cpu_read(allocated_pages);
 	BUG_ON(pages == NULL);
 
 	// complete initialization
@@ -373,13 +370,14 @@ static int worker(void *data)
 	}
 
 	if (alloc_config.bench == BENCH_FRAG) {
+		struct page **pages = this_cpu_read(allocated_pages);
 		pr_info("uninit frag\n");
 		for (u64 j = 0; j < num_allocs; j++) {
-			__free_pages(rand_pages[task_id][j],
+			__free_pages(pages[j],
 				     alloc_config.order);
 		}
-		vfree(rand_pages[task_id]);
-		rand_pages[task_id] = NULL;
+		vfree(pages);
+		this_cpu_write(allocated_pages, NULL);
 	}
 
 	return 0;
@@ -1026,15 +1024,6 @@ static int alloc_init_module(void)
 		return -ENOMEM;
 	}
 
-	rand_pages =
-		kmalloc_array(num_present_cpus(), sizeof(void *), GFP_KERNEL);
-	if (rand_pages == NULL) {
-		proc_remove(dir);
-		proc_remove(out);
-		proc_remove(run);
-		return -ENOMEM;
-	}
-
 	c_barrier_init(&outer_barrier, num_present_cpus() + 1, "outer");
 	c_barrier_init(&inner_barrier, 1, "inner");
 
@@ -1055,7 +1044,6 @@ static void alloc_cleanup_module(void)
 		kfree(alloc_config.threads);
 	if (measurements)
 		kfree(measurements);
-	kfree(rand_pages);
 }
 
 module_init(alloc_init_module);
