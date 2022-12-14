@@ -19,3 +19,4 @@ memfile
 .devcontainer
 /test/
 .cache/
+/tmp.sh

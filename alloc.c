@@ -90,7 +90,8 @@ struct thread_perf {
 	u64 put;
 };
 static DEFINE_PER_CPU(struct thread_perf, thread_perf);
-static DEFINE_PER_CPU(struct page **, allocated_pages);
+/// Allocated pages per task
+struct page ***allocated_pages = NULL;
 
 struct perf {
 	u64 get_min;
@@ -112,7 +113,8 @@ __maybe_unused static u64 cycles(void)
 
 __always_inline static gfp_t gfp_flags(int order)
 {
-	return GFP_USER | (order ? __GFP_COMP : 0);
+	// return GFP_USER | (order ? __GFP_COMP : 0);
+	return GFP_USER;
 }
 
 /// Alloc a number of pages at once and free them afterwards
@@ -122,8 +124,8 @@ static void bulk()
 	u64 timer;
 	struct thread_perf *t_perf = this_cpu_ptr(&thread_perf);
 
-	struct page **pages = kmalloc_array(alloc_config.allocs,
-					    sizeof(struct page *), GFP_KERNEL);
+	struct page **pages =
+		vmalloc_array(alloc_config.allocs, sizeof(struct page *));
 	BUG_ON(pages == NULL);
 
 	// complete initialization
@@ -145,7 +147,7 @@ static void bulk()
 		__free_pages(pages[j], alloc_config.order);
 	}
 	t_perf->put = (ktime_get_ns() - timer) / alloc_config.allocs;
-	kfree(pages);
+	vfree(pages);
 }
 
 /// Alloc and free the same page
@@ -189,7 +191,7 @@ static void rand(u64 task_id, u64 *rng)
 				       alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
-	this_cpu_write(allocated_pages, pages);
+	allocated_pages[task_id] = pages;
 
 	// complete initialization
 	c_barrier_sync(&inner_barrier);
@@ -201,8 +203,9 @@ static void rand(u64 task_id, u64 *rng)
 		for (u64 i = 0; i < alloc_config.allocs * threads; i++) {
 			u64 j = nanorand_random_range(
 				rng, 0, alloc_config.allocs * threads);
-			struct page **cpu_a = per_cpu(allocated_pages, i % threads);
-			struct page **cpu_b = per_cpu(allocated_pages, i % threads);
+			struct page **cpu_a = allocated_pages[i % threads];
+			struct page **cpu_b = allocated_pages[j % threads];
+			BUG_ON(cpu_a == NULL || cpu_b == NULL);
 			swap(cpu_a[i / threads], cpu_b[j / threads]);
 		}
 		pr_info("setup finished\n");
@@ -250,7 +253,7 @@ static u64 init_frag(u64 task_id)
 			alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
-	this_cpu_write(allocated_pages, pages);
+	allocated_pages[task_id] = pages;
 
 	c_barrier_sync(&outer_barrier);
 
@@ -261,8 +264,9 @@ static u64 init_frag(u64 task_id)
 		for (u64 i = 0; i < num_allocs * threads; i++) {
 			u64 j = nanorand_random_range(&rng, 0,
 						      num_allocs * threads);
-			struct page **cpu_a = per_cpu(allocated_pages, i % threads);
-			struct page **cpu_b = per_cpu(allocated_pages, i % threads);
+			struct page **cpu_a = allocated_pages[i % threads];
+			struct page **cpu_b = allocated_pages[j % threads];
+			BUG_ON(cpu_a == NULL || cpu_b == NULL);
 			swap(cpu_a[i / threads], cpu_b[j / threads]);
 		}
 		pr_info("setup finished\n");
@@ -286,7 +290,7 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 
 	u64 rng_copy = *rng;
 
-	struct page **pages = this_cpu_read(allocated_pages);
+	struct page **pages = allocated_pages[task_id];
 	BUG_ON(pages == NULL);
 
 	// complete initialization
@@ -370,11 +374,10 @@ static int worker(void *data)
 	}
 
 	if (alloc_config.bench == BENCH_FRAG) {
-		struct page **pages = this_cpu_read(allocated_pages);
+		struct page **pages = allocated_pages[task_id];
 		pr_info("uninit frag\n");
 		for (u64 j = 0; j < num_allocs; j++) {
-			__free_pages(pages[j],
-				     alloc_config.order);
+			__free_pages(pages[j], alloc_config.order);
 		}
 		vfree(pages);
 		this_cpu_write(allocated_pages, NULL);
@@ -486,12 +489,9 @@ static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
 void iteration(u32 bench, u64 i, u64 iter)
 {
 	struct perf *p;
-	u64 threads = max_threads;
+	u64 threads = bench == BENCH_FRAG ? max_threads :
+					    alloc_config.threads[i];
 	u64 time;
-
-	if (bench != BENCH_FRAG) {
-		threads = alloc_config.threads[i];
-	}
 
 	atomic64_set(&curr_threads, threads);
 	c_barrier_reinit(&inner_barrier, threads);
@@ -551,17 +551,21 @@ void iteration(u32 bench, u64 i, u64 iter)
 
 static void *out_start(struct seq_file *m, loff_t *pos)
 {
-	if ((alloc_config.bench == BENCH_FRAG && *pos > 0) ||
-	    *pos >= alloc_config.threads_len)
+	u64 threads_len =
+		alloc_config.bench == BENCH_FRAG ? 1 : alloc_config.threads_len;
+
+	if (*pos >= (threads_len * alloc_config.iterations))
 		return NULL;
 	return pos;
 }
 
 static void *out_next(struct seq_file *m, void *arg, loff_t *pos)
 {
+	u64 threads_len =
+		alloc_config.bench == BENCH_FRAG ? 1 : alloc_config.threads_len;
+
 	(*pos)++;
-	if (alloc_config.bench == BENCH_FRAG ||
-	    *pos >= alloc_config.threads_len)
+	if (*pos >= (threads_len * alloc_config.iterations))
 		return NULL;
 	return pos;
 }
@@ -570,20 +574,20 @@ static void out_stop(struct seq_file *m, void *arg)
 {
 }
 
-static int out_show_frag(struct seq_file *m)
+static int out_show_frag(struct seq_file *m, u64 iter)
 {
-	seq_puts(m, "threads,iter,allocs,small,huge,huge2\n");
+	struct perf *p;
+	BUG_ON(iter > alloc_config.iterations);
 
-	// The output buffer has only the size of a PAGE.
-	// If our output is larger we have to output it in multiple steps.
-	for (ssize_t iter = 0; iter < alloc_config.iterations; iter++) {
-		struct perf *p = &measurements[iter];
+	if (iter == 0)
+		seq_puts(m, "order,threads,iter,allocs,small,huge\n");
 
-		seq_printf(m, "%llu,%lu,%llu,%llu,%llu,%llu\n", max_threads,
-			   iter, alloc_config.realloc_percentage, p->put_avg,
-			   p->get_avg, p->get_min);
-		BUG_ON(seq_has_overflowed(m));
-	}
+	p = &measurements[iter];
+	seq_printf(m, "%llu,%llu,%lu,%llu,%llu,%llu\n", alloc_config.order,
+		   max_threads, iter, alloc_config.realloc_percentage,
+		   p->put_avg, p->get_avg);
+
+	BUG_ON(seq_has_overflowed(m));
 
 	return 0;
 }
@@ -592,38 +596,34 @@ static int out_show_frag(struct seq_file *m)
 /// Note: `buf` is PAGE_SIZE large!
 static int out_show(struct seq_file *m, void *arg)
 {
-	u64 i = *(loff_t *)arg;
+	u64 off = *(loff_t *)arg;
 
 	if (running || measurements == NULL)
 		return -EINPROGRESS;
 
 	if (alloc_config.bench == BENCH_FRAG) {
-		BUG_ON(i > 0);
-		return out_show_frag(m);
-	}
-	BUG_ON(i > alloc_config.threads_len);
+		return out_show_frag(m, off);
+	} else {
+		u64 iter = off % alloc_config.iterations;
+		u64 idx = off / alloc_config.iterations;
+		struct perf *p;
+		u64 threads;
 
-	if (i == 0)
-		seq_puts(m, "alloc,x,iteration,allocs,get_min,get_avg,"
-			    "get_max,put_min,put_avg,put_max\n");
+		BUG_ON(idx > alloc_config.threads_len);
+		threads = alloc_config.threads[idx];
 
-	for (; i < alloc_config.threads_len; i++) {
-		// The output buffer has only the size of a PAGE.
-		// If our output is larger we have to output it in multiple steps.
-		for (ssize_t iter = 0; iter < alloc_config.iterations; iter++) {
-			struct perf *p =
-				&measurements[i * alloc_config.iterations +
-					      iter];
+		if (iter == 0 && idx == 0)
+			seq_puts(m, "order,x,iteration,allocs,get_min,get_avg,"
+				    "get_max,put_min,put_avg,put_max\n");
 
-			seq_printf(
-				m,
-				"Kernel,%llu,%lu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-				alloc_config.threads[i], iter,
-				alloc_config.allocs, p->get_min, p->get_avg,
-				p->get_max, p->put_min, p->put_avg, p->put_max);
-		}
-		if (seq_has_overflowed(m))
-			return 0;
+		p = &measurements[idx * alloc_config.iterations + iter];
+		seq_printf(m,
+			   "%llu,%llu,%lu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			   alloc_config.order, threads, iter,
+			   alloc_config.allocs, p->get_min, p->get_avg,
+			   p->get_max, p->put_min, p->put_avg, p->put_max);
+
+		BUG_ON(seq_has_overflowed(m));
 	}
 	return 0;
 }
@@ -876,8 +876,10 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 
 	if (measurements) {
 		for (u64 i = 0; i < previous_iterations; i++) {
-			if (measurements[i].frag_buf)
+			if (measurements[i].frag_buf) {
 				vfree(measurements[i].frag_buf);
+				measurements[i].frag_buf = NULL;
+			}
 		}
 		kfree(measurements);
 	}
@@ -893,8 +895,14 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 
 		for (u64 i = 0; i < alloc_config.iterations; i++) {
 			measurements[i].frag_buf =
-				vmalloc(hpslots * sizeof(u16));
+				vmalloc_array(hpslots, sizeof(u16));
 			BUG_ON(measurements[i].frag_buf == NULL);
+		}
+	} else {
+		// Reset ptrs (or does kmalloc_array zeroize?)
+		for (u64 i = 0; i < threads_len * alloc_config.iterations;
+		     i++) {
+			measurements[i].frag_buf = NULL;
 		}
 	}
 
@@ -1027,6 +1035,10 @@ static int alloc_init_module(void)
 	c_barrier_init(&outer_barrier, num_present_cpus() + 1, "outer");
 	c_barrier_init(&inner_barrier, 1, "inner");
 
+	BUG_ON((allocated_pages = kmalloc_array(num_online_cpus(),
+						sizeof(struct page *),
+						GFP_KERNEL)) == NULL);
+
 	return 0;
 }
 
@@ -1044,6 +1056,8 @@ static void alloc_cleanup_module(void)
 		kfree(alloc_config.threads);
 	if (measurements)
 		kfree(measurements);
+	if (allocated_pages)
+		kfree(allocated_pages);
 }
 
 module_init(alloc_init_module);
