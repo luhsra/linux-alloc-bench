@@ -114,7 +114,7 @@ __maybe_unused static u64 cycles(void)
 __always_inline static gfp_t gfp_flags(int order)
 {
 	// return GFP_USER | (order ? __GFP_COMP : 0);
-	return GFP_USER;
+	return GFP_HIGHUSER_MOVABLE;
 }
 
 /// Alloc a number of pages at once and free them afterwards
