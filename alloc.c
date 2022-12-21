@@ -286,7 +286,7 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 {
 	u64 num_reallocs = (num_allocs * alloc_config.realloc_percentage) / 100;
 	int node = alloc_config.node;
-	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+	// struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
 
 	u64 rng_copy = *rng;
 
@@ -309,7 +309,7 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 
 	// Draining to allow the kernel allocator to defragment its pages...
 	// FIXME: This seems have no effect on the kernel -> it still does not defragment!
-	drain_local_pages(zone);
+	// drain_local_pages(zone);
 
 	c_barrier_sync(&inner_barrier);
 
