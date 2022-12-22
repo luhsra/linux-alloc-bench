@@ -9,6 +9,12 @@ This module contains multiple kernelspace benchmarks for the Linux allocator:
 
 ## Usage
 
+Building the module.
+
+```bash
+make LINUX_BUILD_DIR=../nvalloc-linux/build-nvalloc-vm LLVM=1
+```
+
 Load the benchmark module.
 
 ```bash
