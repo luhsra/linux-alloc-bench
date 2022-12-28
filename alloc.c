@@ -118,7 +118,7 @@ __always_inline static gfp_t gfp_flags(int order)
 }
 
 /// Alloc a number of pages at once and free them afterwards
-static void bulk()
+static void bulk(void)
 {
 	u64 j;
 	u64 timer;
@@ -151,7 +151,7 @@ static void bulk()
 }
 
 /// Alloc and free the same page
-static void repeat()
+static void repeat(void)
 {
 	u64 j;
 	u64 timer;
