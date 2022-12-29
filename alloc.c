@@ -129,7 +129,6 @@ static void bulk(void)
 	BUG_ON(pages == NULL);
 
 	// complete initialization
-	pr_info("start bulk");
 	c_barrier_sync(&inner_barrier);
 
 	timer = ktime_get_ns();

@@ -32,24 +32,34 @@ static inline void c_barrier_init(struct c_barrier *self, uint n,
 /// No threads are allowed to wait on this barrier for reinit!
 static inline void c_barrier_reinit(struct c_barrier *self, uint n)
 {
-	BUG_ON(atomic_read(&self->counter) != self->max ||
-	       swait_active(&self->wait));
+	int ret;
+	preempt_disable();
 
+	BUG_ON(swait_active(&self->wait));
+	ret = atomic_cmpxchg(&self->counter, self->max, n);
+	BUG_ON(ret != self->max); // no waiting threads!
 	self->max = n;
-	atomic_set(&self->counter, n);
-	atomic_set(&self->generation, 0);
+
+	preempt_disable();
 }
 
 static inline void c_barrier_sync(struct c_barrier *self)
 {
-	int counter = atomic_fetch_dec(&self->counter);
+	int counter;
+	preempt_disable();
+
+	counter = atomic_fetch_dec(&self->counter);
 	BUG_ON(counter <= 0);
 	if (counter == 1) {
 		atomic_set(&self->counter, self->max);
 		atomic_inc(&self->generation);
+
+		preempt_enable();
 		swake_up_all(&self->wait);
 	} else {
 		int generation = atomic_read(&self->generation);
+
+		preempt_enable();
 		// Wait for wakeup
 		swait_event_exclusive(self->wait,
 				      atomic_read(&self->generation) !=
