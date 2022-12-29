@@ -36,11 +36,12 @@ static inline void c_barrier_reinit(struct c_barrier *self, uint n)
 	preempt_disable();
 
 	BUG_ON(swait_active(&self->wait));
+
 	ret = atomic_cmpxchg(&self->counter, self->max, n);
 	BUG_ON(ret != self->max); // no waiting threads!
 	self->max = n;
 
-	preempt_disable();
+	preempt_enable();
 }
 
 static inline void c_barrier_sync(struct c_barrier *self)
