@@ -1,6 +1,7 @@
 #ifndef __NVALLOC_UTIL__
 #define __NVALLOC_UTIL__
 
+#include <linux/jiffies.h>
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/mmzone.h>
@@ -59,7 +60,10 @@ static inline void c_barrier_sync(struct c_barrier *self)
 
 		complete_all(&self->comp[last]);
 	} else {
-		wait_for_completion(&self->comp[self->active]);
+		unsigned long timeout = wait_for_completion_timeout(&self->comp[self->active], msecs_to_jiffies(10000));
+		if (timeout == 0) {
+			pr_info("Barrier timeout: %s\n", self->name);
+		}
 	}
 }
 
