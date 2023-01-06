@@ -479,7 +479,7 @@ static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
 }
 #endif
 
-void iteration(u32 bench, u64 i, u64 iter)
+void iteration(u32 bench, u64 i, u64 iter, const struct cpumask *mask)
 {
 	struct perf *p;
 	u64 threads = bench == BENCH_FRAG ? max_threads :
@@ -507,23 +507,26 @@ void iteration(u32 bench, u64 i, u64 iter)
 	p->put_avg = 0;
 	p->put_max = 0;
 	if (alloc_config.bench != BENCH_FRAG) {
+		int cpu;
+		u64 t = 0;
 		p->get_min = (u64)-1;
 		p->put_min = (u64)-1;
-		for (u64 t = 0; t < threads; t++) {
-			u64 get, put;
-			struct thread_perf *t_perf =
-				per_cpu_ptr(&thread_perf, t);
+
+		for_each_cpu(cpu, mask) {
+			struct thread_perf *t_perf;
+			if (t >= threads)
+				break;
+
+			t_perf = per_cpu_ptr(&thread_perf, cpu);
 			BUG_ON(t_perf == NULL);
 
-			get = t_perf->get;
-			put = t_perf->put;
-
-			p->get_min = min(p->get_min, get);
-			p->get_avg += get;
-			p->get_max = max(p->get_max, get);
-			p->put_min = min(p->put_min, put);
-			p->put_avg += put;
-			p->put_max = max(p->put_max, put);
+			p->get_min = min(p->get_min, t_perf->get);
+			p->get_avg += t_perf->get;
+			p->get_max = max(p->get_max, t_perf->get);
+			p->put_min = min(p->put_min, t_perf->put);
+			p->put_avg += t_perf->put;
+			p->put_max = max(p->put_max, t_perf->put);
+			t++;
 		}
 		p->get_avg /= threads;
 		p->put_avg /= threads;
@@ -921,7 +924,7 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 	pr_info("Start iterating\n");
 	for (u64 i = 0; i < threads_len; i++) {
 		for (u64 iter = 0; iter < alloc_config.iterations; iter++) {
-			iteration(alloc_config.bench, i, iter);
+			iteration(alloc_config.bench, i, iter, mask);
 		}
 	}
 
