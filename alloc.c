@@ -64,12 +64,12 @@ struct alloc_config {
 		};
 		// frag
 		struct {
-			/// NUMA node
-			u64 node;
 			/// Percentage to be reallocated per iteration
 			u64 realloc_percentage;
 		};
 	};
+	/// NUMA node
+	u64 node;
 	/// Number of repetitions
 	u64 iterations;
 	/// Size of the allocations
@@ -111,10 +111,9 @@ __maybe_unused static u64 cycles(void)
 	return ((u64)lo) | ((u64)hi << 32);
 };
 
-__always_inline static gfp_t gfp_flags(int order)
+__always_inline static gfp_t gfp_flags(void)
 {
-	// return GFP_USER | (order ? __GFP_COMP : 0);
-	return GFP_HIGHUSER_MOVABLE;
+	return GFP_HIGHUSER_MOVABLE | __GFP_THISNODE;
 }
 
 /// Alloc a number of pages at once and free them afterwards
@@ -133,8 +132,8 @@ static void bulk(void)
 
 	timer = ktime_get_ns();
 	for (j = 0; j < alloc_config.allocs; j++) {
-		pages[j] = alloc_pages(gfp_flags(alloc_config.order),
-				       alloc_config.order);
+		pages[j] = alloc_pages_node(alloc_config.node, gfp_flags(),
+					    alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	t_perf->get = (ktime_get_ns() - timer) / alloc_config.allocs;
@@ -164,8 +163,8 @@ static void repeat(void)
 
 	timer = ktime_get_ns();
 	for (j = 0; j < alloc_config.allocs; j++) {
-		page = alloc_pages(gfp_flags(alloc_config.order),
-				   alloc_config.order);
+		page = alloc_pages_node(alloc_config.node, gfp_flags(),
+					alloc_config.order);
 		BUG_ON(page == NULL);
 		__free_pages(page, alloc_config.order);
 	}
@@ -186,8 +185,8 @@ static void rand(u64 task_id, u64 *rng)
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < alloc_config.allocs; j++) {
-		pages[j] = alloc_pages(gfp_flags(alloc_config.order),
-				       alloc_config.order);
+		pages[j] = alloc_pages_node(alloc_config.node, gfp_flags(),
+					    alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	allocated_pages[task_id] = pages;
@@ -227,8 +226,8 @@ static void rand(u64 task_id, u64 *rng)
 static u64 init_frag(u64 task_id)
 {
 	u64 threads = max_threads;
-	int node = cpu_to_node(raw_smp_processor_id());
-	struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
+	struct zone *zone =
+		&NODE_DATA(alloc_config.node)->node_zones[ZONE_NORMAL];
 	struct page **pages;
 	u64 free_pages;
 	u64 num_allocs;
@@ -247,9 +246,8 @@ static u64 init_frag(u64 task_id)
 	BUG_ON(pages == NULL);
 
 	for (u64 j = 0; j < num_allocs; j++) {
-		pages[j] = alloc_pages_node(
-			node, gfp_flags(alloc_config.order) | __GFP_THISNODE,
-			alloc_config.order);
+		pages[j] = alloc_pages_node(alloc_config.node, gfp_flags(),
+					    alloc_config.order);
 		BUG_ON(pages[j] == NULL);
 	}
 	allocated_pages[task_id] = pages;
@@ -284,9 +282,6 @@ static u64 init_frag(u64 task_id)
 static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 {
 	u64 num_reallocs = (num_allocs * alloc_config.realloc_percentage) / 100;
-	int node = alloc_config.node;
-	// struct zone *zone = &NODE_DATA(node)->node_zones[ZONE_NORMAL];
-
 	u64 rng_copy = *rng;
 
 	struct page **pages = allocated_pages[task_id];
@@ -315,10 +310,9 @@ static void frag(u64 task_id, u64 *rng, u64 num_allocs)
 	for (u64 j = 0; j < num_reallocs;) {
 		u64 i = nanorand_random_range(&rng_copy, 0, num_allocs);
 		if (pages[i] == NULL) {
-			pages[i] = alloc_pages_node(
-				node,
-				gfp_flags(alloc_config.order) | __GFP_THISNODE,
-				alloc_config.order);
+			pages[i] = alloc_pages_node(alloc_config.node,
+						    gfp_flags(),
+						    alloc_config.order);
 			BUG_ON(pages[i] == NULL);
 			j++;
 		}
@@ -740,7 +734,7 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 
 	if (len == 0 || buf == NULL || args == NULL) {
 		pr_err("usage: \n"
-		       "\t(bulk|repeat|rand) <iterations> <allocs> <order> <threads>\n"
+		       "\t(bulk|repeat|rand) <iterations> <allocs> <order> <threads> <node>\n"
 		       "\tfrag <iterations> <realloc_percentage> <order> <node>\n");
 		return false;
 	}
@@ -789,12 +783,11 @@ static bool argparse(const char *buf, size_t len, struct alloc_config *args)
 			pr_err("Invalid <threads>\n");
 			return false;
 		}
-	} else {
-		if ((buf = next_uint(buf, end, &node)) == NULL ||
-		    node > nr_online_nodes) {
-			pr_err("Invalid <node>\n");
-			return false;
-		}
+	}
+	if ((buf = next_uint(buf, end, &node)) == NULL ||
+	    node > nr_online_nodes) {
+		pr_err("Invalid <node>\n");
+		return false;
 	}
 
 	buf = str_skip(buf, end, true);
@@ -826,10 +819,11 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 		  loff_t *pos)
 {
 	int cpu;
-	const struct cpumask *mask = &__cpu_online_mask;
+	const struct cpumask *mask = cpumask_of_node(alloc_config.node);
 	u64 threads = 0;
 	u64 threads_len = 1;
 	char *kbuf;
+	u64 max_node_cores = 0;
 	u64 previous_iterations = alloc_config.iterations;
 
 	if (running)
@@ -855,6 +849,9 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 
 	running = true;
 
+	for_each_cpu(cpu, mask)
+		max_node_cores++;
+
 	max_threads = 0;
 	if (alloc_config.bench != BENCH_FRAG) {
 		// Retrieve max thread count
@@ -862,15 +859,11 @@ ssize_t run_write(struct file *file, const char __user *buf, size_t len,
 		for (u64 i = 0; i < threads_len; i++) {
 			max_threads = max(alloc_config.threads[i], max_threads);
 		}
+		BUG_ON(max_threads > max_node_cores);
 	} else {
-		// cpus of this node!
-		int cpu;
-		mask = cpumask_of_node(alloc_config.node);
-		for_each_cpu(cpu, mask) {
-			max_threads++;
-		}
+		max_threads = max_node_cores;
 	}
-	BUG_ON(max_threads > num_online_cpus());
+
 	c_barrier_reinit(&outer_barrier, max_threads + 1);
 
 	if (measurements) {
