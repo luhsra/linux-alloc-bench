@@ -6,6 +6,11 @@
 #include <linux/completion.h>
 #include <linux/mmzone.h>
 
+// Workaround for older kernel versions 
+#ifndef CACHELINE_PADDING
+#define CACHELINE_PADDING(x) ZONE_PADDING(x)
+#endif
+
 /// PThread-like synchronization barrier
 struct c_barrier {
 	/// Number of still running threads (wait decrements this)
@@ -13,7 +18,7 @@ struct c_barrier {
 	/// Number of managed threads
 	atomic_t threads;
 	/// Cacheline padding -> no false sharing
-	ZONE_PADDING(_pad);
+	CACHELINE_PADDING(_pad);
 
 	/// Completions (one active, one for reinit)
 	struct completion comp[2];

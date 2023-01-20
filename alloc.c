@@ -28,6 +28,11 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Kernel Alloc Benchmark");
 MODULE_AUTHOR("Lars Wrenger");
 
+#ifndef CONFIG_TRANSPARENT_HUGEPAGE
+#undef HPAGE_PMD_NR
+#define HPAGE_PMD_NR 512
+#endif
+
 static atomic64_t curr_threads;
 static u64 max_threads;
 
@@ -326,7 +331,7 @@ static int worker(void *data)
 	u64 cpu = raw_smp_processor_id();
 	u64 thread_rng = task_id;
 
-	pr_info("Worker t=%u c=%u bench %u\n", task_id, cpu,
+	pr_info("Worker t=%llu c=%llu bench %d\n", task_id, cpu,
 		alloc_config.bench);
 
 	if (alloc_config.bench == BENCH_FRAG) {
@@ -339,12 +344,12 @@ static int worker(void *data)
 		c_barrier_sync(&outer_barrier);
 
 		if (kthread_should_stop() || !running) {
-			pr_info("Stopping worker %d\n", task_id);
+			pr_info("Stopping worker %llu\n", task_id);
 			break;
 		}
 		threads = atomic64_read(&curr_threads);
 
-		pr_info("Execute t=%d c=%d run=%d", task_id, cpu,
+		pr_info("Execute t=%llu c=%llu run=%d", task_id, cpu,
 			task_id < threads);
 		if (task_id < threads) {
 			switch (alloc_config.bench) {
@@ -390,7 +395,7 @@ static inline u16 count_free_pages_per_huge_page_slot(u64 hp_pfn)
 		struct page *page;
 
 		if (!pfn_valid(pfn)) {
-			printk(KERN_WARNING "Invalid pfn: %lx\n", pfn);
+			printk(KERN_WARNING "Invalid pfn: %llx\n", pfn);
 			continue;
 		}
 
@@ -579,7 +584,7 @@ static int out_show_frag(struct seq_file *m, u64 iter)
 		seq_puts(m, "order,threads,iter,allocs,small,huge\n");
 
 	p = &measurements[iter];
-	seq_printf(m, "%llu,%llu,%lu,%llu,%llu,%llu\n", alloc_config.order,
+	seq_printf(m, "%llu,%llu,%llu,%llu,%llu,%llu\n", alloc_config.order,
 		   max_threads, iter, alloc_config.realloc_percentage,
 		   p->put_avg, p->get_avg);
 
@@ -614,11 +619,12 @@ static int out_show(struct seq_file *m, void *arg)
 
 		p = &measurements[idx * alloc_config.iterations + iter];
 		seq_printf(m,
-			   "%llu,%llu,%lu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			   "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
 			   alloc_config.order, threads, iter,
 			   alloc_config.allocs, p->get_min, p->get_avg,
 			   p->get_max, p->put_min, p->put_avg, p->put_max);
 
+		// TODO: Fix me! Measurements including all core counts from (1-26) lead to output that does not fit into a single 4K buffer!
 		BUG_ON(seq_has_overflowed(m));
 	}
 	return 0;
