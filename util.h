@@ -1,12 +1,12 @@
-#ifndef __NVALLOC_UTIL__
-#define __NVALLOC_UTIL__
+#ifndef __LLFREE_UTIL__
+#define __LLFREE_UTIL__
 
 #include <linux/jiffies.h>
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/mmzone.h>
 
-// Workaround for older kernel versions 
+// Workaround for older kernel versions
 #ifndef CACHELINE_PADDING
 #define CACHELINE_PADDING(x) ZONE_PADDING(x)
 #endif
@@ -72,4 +72,4 @@ static inline void c_barrier_sync(struct c_barrier *self)
 	}
 }
 
-#endif // __NVALLOC_UTIL__
+#endif // __LLFREE_UTIL__

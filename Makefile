@@ -1,4 +1,4 @@
-LINUX_BUILD_DIR ?= $(PWD)/../nvalloc-linux/build-nvalloc-vm
+LINUX_BUILD_DIR ?= $(PWD)/../llfree-linux/build-llfree-vm
 LINUX_SRC_DIR ?= $(LINUX_BUILD_DIR)/..
 
 obj-m += alloc.o

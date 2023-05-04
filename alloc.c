@@ -17,8 +17,8 @@
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 
-#ifdef CONFIG_NVALLOC
-#include <nvalloc.h>
+#ifdef CONFIG_LLFREE
+#include <llfree.h>
 #endif
 
 #include "nanorand.h"
@@ -384,7 +384,7 @@ static int worker(void *data)
 	return 0;
 }
 
-#ifndef CONFIG_NVALLOC
+#ifndef CONFIG_LLFREE
 // The parameter hp_pfn describes a huge page slot (512 pages).
 // It must therefore be huge page aligned,
 // pfn+512-1 must still be in the range of the zone.
@@ -479,7 +479,7 @@ static void for_each_huge_page(void *arg, u16 count)
 static void get_huge_page_slots_info(struct zone *zone, u16 *buf)
 {
 	u16 *local_buf = buf;
-	nvalloc_for_each_huge_page(zone->nvalloc, for_each_huge_page,
+	llfree_for_each_huge_page(zone->llfree, for_each_huge_page,
 				   &local_buf);
 }
 #endif
@@ -539,11 +539,11 @@ void iteration(u32 bench, u64 i, u64 iter, const struct cpumask *mask)
 		struct zone *zone =
 			&NODE_DATA(alloc_config.node)->node_zones[ZONE_NORMAL];
 
-#ifndef CONFIG_NVALLOC
+#ifndef CONFIG_LLFREE
 		p->get_avg = zone->free_area[9].nr_free +
 			     2 * zone->free_area[10].nr_free;
 #else
-		p->get_avg = nvalloc_free_huge_count(zone->nvalloc);
+		p->get_avg = llfree_free_huge_count(zone->llfree);
 #endif
 		p->put_avg = zone_page_state(zone, NR_FREE_PAGES);
 		get_huge_page_slots_info(zone, p->frag_buf);
