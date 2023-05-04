@@ -20,3 +20,4 @@ memfile
 /test/
 .cache/
 /tmp.sh
+/build-*/
