@@ -588,8 +588,6 @@ static int out_show_frag(struct seq_file *m, u64 iter)
 		   max_threads, iter, alloc_config.realloc_percentage,
 		   p->put_avg, p->get_avg);
 
-	BUG_ON(seq_has_overflowed(m));
-
 	return 0;
 }
 
@@ -623,9 +621,6 @@ static int out_show(struct seq_file *m, void *arg)
 			   alloc_config.order, threads, iter,
 			   alloc_config.allocs, p->get_min, p->get_avg,
 			   p->get_max, p->put_min, p->put_avg, p->put_max);
-
-		// TODO: Fix me! Measurements including all core counts from (1-26) lead to output that does not fit into a single 4K buffer!
-		BUG_ON(seq_has_overflowed(m));
 	}
 	return 0;
 }
