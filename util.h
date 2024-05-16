@@ -65,7 +65,8 @@ static inline void c_barrier_sync(struct c_barrier *self)
 
 		complete_all(&self->comp[last]);
 	} else {
-		unsigned long timeout = wait_for_completion_timeout(&self->comp[self->active], msecs_to_jiffies(10000));
+		unsigned long timeout = wait_for_completion_timeout(
+			&self->comp[self->active], msecs_to_jiffies(60000));
 		if (timeout == 0) {
 			pr_info("Barrier timeout: %s\n", self->name);
 		}

@@ -149,7 +149,8 @@ static void bulk(void)
 		*addr = 1; // Write to trigger EPT fault
 #endif
 	}
-	t_perf->get = (ktime_get_ns() - timer) / alloc_config.allocs;
+	timer = ktime_get_ns() - timer;
+	t_perf->get = timer / alloc_config.allocs;
 
 	c_barrier_sync(&inner_barrier);
 
@@ -157,7 +158,8 @@ static void bulk(void)
 	for (u64 j = 0; j < alloc_config.allocs; j++) {
 		__free_pages(pages[j], alloc_config.order);
 	}
-	t_perf->put = (ktime_get_ns() - timer) / alloc_config.allocs;
+	timer = ktime_get_ns() - timer;
+	t_perf->put = timer / alloc_config.allocs;
 	vfree(pages);
 }
 
@@ -379,7 +381,7 @@ static int worker(void *data)
 				break;
 #endif
 			default:
-				pr_err("Unknown benchmark");
+				pr_err("Unknown benchmark\n");
 				break;
 			}
 		}
@@ -555,7 +557,7 @@ void iteration(u32 bench, u64 i, u64 iter, const struct cpumask *mask)
 		p->get_avg /= threads;
 		p->put_avg /= threads;
 	} else {
-#if 0
+#ifdef LAB_BENCH_FRAG
 		struct zone *zone =
 			&NODE_DATA(alloc_config.node)->node_zones[ZONE_NORMAL];
 
