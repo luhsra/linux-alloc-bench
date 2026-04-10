@@ -21,3 +21,4 @@ memfile
 .cache/
 /tmp.sh
 /build-*/
+.direnv/

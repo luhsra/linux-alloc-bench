@@ -17,6 +17,7 @@
               lld
               llvm
               ncurses
+              just
             ];
             inputsFrom = [ pkgs.linux ];
             hardeningDisable = [ "all" ];
